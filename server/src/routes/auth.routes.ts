@@ -1,14 +1,15 @@
 import { Router, Request, Response } from "express";
 import { pool } from "../config/db.js";
 import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
 import { z } from "zod";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth.js";
 import Stripe from "stripe";
 
 const router = Router();
 const JWT_SECRET = process.env.JWT_SECRET || "fallback_secret";
+const SALT_ROUNDS = 12;
 
-// Initialize Stripe SDK (uses real key if provided, or safe test fallback)
 const stripe = new Stripe(
   process.env.STRIPE_SECRET_KEY || "sk_test_51MockKeyDigitalHeroes2026",
   {
@@ -39,15 +40,23 @@ router.post("/signup", async (req: Request, res: Response) => {
 
   try {
     const existing = await pool.query("SELECT id FROM users WHERE email = $1", [
-      email,
+      email.toLowerCase(),
     ]);
     if (existing.rows.length > 0)
       return res.status(400).json({ error: "Email already registered." });
 
+    const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
+
     const newUser = await pool.query(
       `INSERT INTO users (email, password_hash, full_name, selected_charity_id, charity_percentage)
        VALUES ($1, $2, $3, $4, $5) RETURNING id, email, full_name, role, selected_charity_id, charity_percentage`,
-      [email, password, full_name, selected_charity_id, charity_percentage],
+      [
+        email.toLowerCase(),
+        passwordHash,
+        full_name,
+        selected_charity_id,
+        charity_percentage,
+      ],
     );
 
     const user = newUser.rows[0];
@@ -64,15 +73,37 @@ router.post("/signup", async (req: Request, res: Response) => {
 
 router.post("/login", async (req: Request, res: Response) => {
   const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email and password are required." });
+  }
+
   try {
-    const result = await pool.query(
-      "SELECT * FROM users WHERE email = $1 AND password_hash = $2",
-      [email, password],
-    );
+    const result = await pool.query("SELECT * FROM users WHERE email = $1", [
+      String(email).toLowerCase(),
+    ]);
     if (result.rows.length === 0)
       return res.status(401).json({ error: "Invalid email or password." });
 
     const user = result.rows[0];
+    const storedHash: string = user.password_hash || "";
+
+    let isMatch = false;
+    // Standard bcrypt hash check
+    if (storedHash.startsWith("$2a$") || storedHash.startsWith("$2b$")) {
+      isMatch = await bcrypt.compare(password, storedHash);
+    } else if (storedHash === password) {
+      // Auto-upgrade legacy seeded plaintext password to bcrypt hash in DB
+      isMatch = true;
+      const upgradedHash = await bcrypt.hash(password, SALT_ROUNDS);
+      await pool.query("UPDATE users SET password_hash = $1 WHERE id = $2", [
+        upgradedHash,
+        user.id,
+      ]);
+    }
+
+    if (!isMatch)
+      return res.status(401).json({ error: "Invalid email or password." });
+
     const token = jwt.sign(
       { id: user.id, email: user.email, role: user.role },
       JWT_SECRET,
@@ -135,7 +166,6 @@ router.post(
     const interval = plan_type === "yearly" ? "365 days" : "30 days";
     const stripeSessionId = `cs_live_dh_${Date.now()}_${card_last4}`;
 
-    // If user configured a real live/test Stripe secret key, attempt a real PaymentIntent creation
     if (
       process.env.STRIPE_SECRET_KEY &&
       process.env.STRIPE_SECRET_KEY.startsWith("sk_test_") &&
@@ -148,7 +178,7 @@ router.post(
           description: `Digital Heroes ${plan_type} subscription`,
         });
       } catch {
-        // Fallback gracefully to internal session ID if Stripe key is placeholder
+        // Fallback gracefully to internal session ID
       }
     }
 
@@ -162,7 +192,6 @@ router.post(
         [req.user!.id, plan_type, amountCents, stripeSessionId],
       );
 
-      // Credit charity split automatically (Section 08.1)
       const userRes = await pool.query(
         "SELECT selected_charity_id, charity_percentage FROM users WHERE id = $1",
         [req.user!.id],
@@ -246,7 +275,7 @@ router.put(
       const updated = await pool.query(
         `UPDATE users SET full_name = $1, email = $2 WHERE id = $3
        RETURNING id, email, full_name, role, selected_charity_id, charity_percentage`,
-        [full_name, email, req.user!.id],
+        [full_name, email.toLowerCase(), req.user!.id],
       );
       res.json({ user: updated.rows[0] });
     } catch (err: any) {
